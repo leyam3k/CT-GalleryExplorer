@@ -1,0 +1,11 @@
+{
+    "display_name": "CT-GalleryExplorer",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "leyam3k",
+    "version": "1.0.0",
+    "homePage": "https://github.com/leyam3k/CT-GalleryExplorer"
+}
