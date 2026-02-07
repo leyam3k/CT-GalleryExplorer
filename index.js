@@ -1,1175 +1,856 @@
-const extensionName = "SillyTavern-ImageGallery";
 
-let currentFolder = '';
-let currentImages = [];
-let currentImageIndex = -1;
+import { extension_settings, getContext } from "../../../extensions.js";
+import { saveSettingsDebounced, eventSource, event_types, characters, this_chid } from "../../../../script.js";
 
-// Selection Mode State
-let isSelectionMode = false;
-let selectedImages = new Set();
+const extensionName = "CT-GalleryExplorer";
+const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 
-let galleryRect = null;
-let viewerRect = null;
+// Default Settings
+const defaultSettings = {
+    sortOrder: 'newest', // newest, oldest, nameAsc, nameDesc
+    lastFolder: '',
+    enableSidebar: true,
+    enableCharHeader: true,
+};
 
-try {
-    const saved = localStorage.getItem('ST-ImageGallery-State');
-    if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed.galleryRect) galleryRect = parsed.galleryRect;
-        if (parsed.viewerRect) viewerRect = parsed.viewerRect;
+// State
+let galleryState = {
+    isOpen: false,
+    currentFolder: '',
+    images: [], // Array of filenames
+    selectedIndex: -1,
+    selectionMode: false,
+    selectedImages: new Set(),
+    galleryRect: { top: 50, left: 50, width: 800, height: 600 },
+    viewerRect: { top: 50, left: 50, width: 600, height: 700 }, // Legacy, viewer is now usually fixed/modal
+    zoom: 1,
+    pan: { x: 0, y: 0 }
+};
+
+// Load Settings
+function loadSettings() {
+    extension_settings[extensionName] = extension_settings[extensionName] || {};
+    for (const key in defaultSettings) {
+        if (!Object.hasOwn(extension_settings[extensionName], key)) {
+            extension_settings[extensionName][key] = defaultSettings[key];
+        }
     }
-} catch (e) {
-    console.error('Failed to load gallery state', e);
+    
+    // Load UI state persistence
+    try {
+        const savedState = localStorage.getItem('CT-GalleryExplorer-State');
+        if (savedState) {
+            const parsed = JSON.parse(savedState);
+            if (parsed.galleryRect) galleryState.galleryRect = parsed.galleryRect;
+            // Validate rects
+            galleryState.galleryRect = ensureOnScreen(galleryState.galleryRect, 800, 600);
+        }
+    } catch (e) {
+        console.warn('Failed to load gallery state', e);
+    }
 }
 
-function saveState() {
+function saveUiState() {
     const state = {
-        galleryRect,
-        viewerRect
+        galleryRect: galleryState.galleryRect
     };
-    localStorage.setItem('ST-ImageGallery-State', JSON.stringify(state));
+    localStorage.setItem('CT-GalleryExplorer-State', JSON.stringify(state));
 }
-
-let zoomLevel = 1;
-let panX = 0;
-let panY = 0;
-let isDragging = false;
-let startX = 0;
-let startY = 0;
 
 function ensureOnScreen(rect, defaultWidth, defaultHeight) {
-    if (!rect) {
-        return {
-            top: (window.innerHeight - defaultHeight) / 2,
-            left: (window.innerWidth - defaultWidth) / 2,
-            width: defaultWidth,
-            height: defaultHeight
-        };
-    }
-
+    if (!rect) return { top: 50, left: 50, width: defaultWidth, height: defaultHeight };
+    
     let { top, left, width, height } = rect;
+    const padding = 20;
 
-    if (!width || width < 100) width = defaultWidth;
-    if (!height || height < 100) height = defaultHeight;
+    // Minimums
+    if (width < 200) width = defaultWidth;
+    if (height < 200) height = defaultHeight;
 
-    if (width > window.innerWidth) width = window.innerWidth;
-    if (height > window.innerHeight) height = window.innerHeight;
+    // Viewport bounds
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
 
-    if (left < 0) left = 0;
-    if (top < 0) top = 0;
-
-    if (left + width > window.innerWidth) left = window.innerWidth - width;
-    if (top + height > window.innerHeight) top = window.innerHeight - height;
-
-    if (left < 0) left = 0;
-    if (top < 0) top = 0;
+    if (left + width < padding) left = padding - width + 50;
+    if (left > vw - padding) left = vw - 50;
+    if (top + height < padding) top = padding - height + 50;
+    if (top > vh - padding) top = vh - 50;
 
     return { top, left, width, height };
 }
 
+// API Utilities
 async function apiPost(url, data) {
-    return new Promise((resolve, reject) => {
-        $.ajax({
-            type: 'POST',
-            url: url,
-            data: JSON.stringify(data),
-            contentType: 'application/json',
-            success: function (response) {
-                resolve(response);
-            },
-            error: function (xhr, status, error) {
-                const msg = xhr.responseText || error || status;
-                console.error('API Error:', msg);
-                reject(new Error(msg));
-            }
-        });
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...(getContext().getRequestHeaders ? getContext().getRequestHeaders() : {})
+        },
+        body: JSON.stringify(data)
     });
+    if (!response.ok) throw new Error(response.statusText);
+    return response.json();
 }
 
-let maxZIndex = 100000;
-function bringToFront($element) {
-    maxZIndex++;
-    $element.css('z-index', maxZIndex);
-}
-
-
-let renderReqId = null;
-let latestRequestedFolder = null;
-let activeXhr = null;
-
-async function loadFolders() {
+async function fetchFolders() {
     try {
-        const folders = await apiPost('/api/images/folders', {});
-        renderFolders(folders);
+        return await apiPost('/api/images/folders', {});
     } catch (err) {
         console.error('Gallery Fetch Folders Error:', err);
-        if (window.toastr) toastr.error('Failed to load folders');
+        toastr.error('Failed to load folders');
+        return [];
     }
 }
 
-let sortOrder = 'newest';
+async function fetchImages(folder) {
+    try {
+        const images = await apiPost('/api/images/list', { folder });
+        if (!Array.isArray(images)) throw new Error("Invalid API response");
+        return images;
+    } catch (err) {
+        console.error(`Gallery: Failed to load folder '${folder}'`, err);
+        toastr.error(`Failed to load images for ${folder}`);
+        return [];
+    }
+}
 
-function sortImages(images) {
-    return images.sort((a, b) => {
+async function deleteImageAPI(path) {
+    try {
+        await apiPost('/api/images/delete', { path });
+        return true;
+    } catch (err) {
+        console.error('Delete Error:', err);
+        toastr.error('Failed to delete image');
+        return false;
+    }
+}
+
+// Sorting
+function sortImages(images, order) {
+    return [...images].sort((a, b) => {
+        // Try to parse dates from filenames usually YYYY-MM-DD
         const dateRegex = /(\d{4})[-]?(\d{2})[-]?(\d{2})/;
         const matchA = a.match(dateRegex);
         const matchB = b.match(dateRegex);
 
-        let dateA = matchA ? new Date(`${matchA[1]}-${matchA[2]}-${matchA[3]}`).getTime() : 0;
-        let dateB = matchB ? new Date(`${matchB[1]}-${matchB[2]}-${matchB[3]}`).getTime() : 0;
+        const timeA = matchA ? new Date(`${matchA[1]}-${matchA[2]}-${matchA[3]}`).getTime() : 0;
+        const timeB = matchB ? new Date(`${matchB[1]}-${matchB[2]}-${matchB[3]}`).getTime() : 0;
 
-        let diff = 0;
-        if (sortOrder === 'newest') {
-            diff = dateB - dateA;
-        } else {
-            diff = dateA - dateB;
-        }
-
-        if (diff !== 0) return diff;
-
-        if (sortOrder === 'newest') {
-            return b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' });
-        } else {
-            return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
-        }
+        if (order === 'newest') return timeB - timeA || b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' });
+        if (order === 'oldest') return timeA - timeB || a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+        if (order === 'nameAsc') return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+        if (order === 'nameDesc') return b.localeCompare(a, undefined, { numeric: true, sensitivity: 'base' });
+        return 0;
     });
 }
 
-async function loadImages(folder) {
-    if (!folder) return;
-    latestRequestedFolder = folder;
+// --- Logic ---
 
-    $('#gallery-loading-indicator').show();
-    $('#gallery-image-grid').css('opacity', '0.5');
-
-    if (activeXhr) {
-        activeXhr.abort();
-        activeXhr = null;
-    }
-
-    let localXhr = null;
-
-    try {
-        const images = await new Promise((resolve, reject) => {
-            localXhr = $.ajax({
-                type: 'POST',
-                url: '/api/images/list',
-                data: JSON.stringify({ folder: folder }),
-                contentType: 'application/json',
-                success: resolve,
-                error: (xhr, textStatus, errorThrown) => reject({ xhr, textStatus, errorThrown })
-            });
-            activeXhr = localXhr;
-        });
-
-        if (activeXhr === localXhr) activeXhr = null;
-
-        if (latestRequestedFolder !== folder) return;
-
-        if (!Array.isArray(images)) throw new Error("Invalid API response");
-
-        const sorted = sortImages(images);
-        renderImages(sorted, folder);
-    } catch (err) {
-        if (activeXhr === localXhr) activeXhr = null;
-
-        if (err.textStatus === 'abort' || err.status === 'abort' || (err.xhr && err.xhr.statusText === 'abort')) {
-            return;
+function syncToCurrentCharacter() {
+    const context = getContext();
+    if (context && context.characterId !== undefined && context.characters[context.characterId]) {
+        const charName = context.characters[context.characterId].name;
+        if (charName) {
+            loadFolder(charName);
+            toastr.success(`Synced to ${charName}`);
         }
-
-        if (latestRequestedFolder !== folder) return;
-
-        console.warn(`Gallery: Failed to load folder '${folder}'`, err);
-        if (window.toastr) toastr.error(`Failed to load images.`);
-        $('#gallery-image-grid').html('<div style="padding:20px;">Error loading images.</div>');
-    } finally {
-        if (latestRequestedFolder === folder) {
-            $('#gallery-loading-indicator').hide();
-            $('#gallery-image-grid').css('opacity', '1');
-        }
+    } else {
+        toastr.info("No character selected.");
     }
 }
 
-async function deleteImage(path) {
-    if (!confirm('Are you sure you want to delete this image?')) return;
+// --- UI Rendering ---
 
-    try {
-        await apiPost('/api/images/delete', { path: path });
+function buildGalleryWindow() {
+    if ($('#ct-gallery-explorer').length) return;
 
-        if (window.toastr) toastr.success('Image deleted');
-
-        $('#st-viewer-window').remove();
-
-        if (currentFolder) loadImages(currentFolder);
-    } catch (err) {
-        console.error('Delete Error:', err);
-    }
-}
-
-function renderFolders(folders) {
-    const container = $('#gallery-folder-list');
-    const mobileSelect = $('#gallery-mobile-folder-select');
-
-    container.empty();
-    mobileSelect.empty();
-
-    mobileSelect.append('<option value="" disabled selected>Select Folder...</option>');
-
-    currentFolder = '';
-
-    if (folders.length === 0) {
-        container.html('<div style="padding:20px; text-align:center; color:#888;">No folders found.</div>');
-        mobileSelect.append('<option disabled>No folders</option>');
-        return;
-    }
-
-    folders.forEach(folder => {
-        const item = $(`
-            <div class="list-group-item interactable folder-item" title="${folder}">
-                <div class="list-group-item-action">
-                    <i class="fa-solid fa-folder"></i>
+    const html = `
+        <div id="ct-gallery-explorer" class="ct-gallery-window" style="display:none;">
+            <div class="gallery-header">
+                <div class="gallery-title">
+                    <i class="fa-solid fa-images"></i> Gallery Explorer
                 </div>
-                <div class="list-group-item-label">${folder}</div>
-            </div>
-        `);
-        item.on('click', () => {
-            loadImages(folder);
-            $('#gallery-folder-list .folder-item').removeClass('active');
-            item.addClass('active');
-            mobileSelect.val(folder);
-        });
-        container.append(item);
-
-        mobileSelect.append(`<option value="${folder}">${folder}</option>`);
-    });
-}
-
-function renderImages(images, folder) {
-    if (renderReqId) {
-        cancelAnimationFrame(renderReqId);
-        renderReqId = null;
-    }
-
-    currentImages = images;
-    currentFolder = folder;
-    const container = $('#gallery-image-grid');
-    container.empty();
-
-    $('#gallery-folder-list .folder-item').removeClass('active');
-    $(`#gallery-folder-list .folder-item:contains("${folder}")`).filter((i, e) => $(e).text().trim() === folder).addClass('active');
-    $('#gallery-mobile-folder-select').val(folder);
-
-    if (images.length === 0) {
-        container.html('<div style="padding:20px; text-align:center; color:#888;">No images found.</div>');
-        return;
-    }
-
-    const pageSize = 24;
-    let renderIndex = 0;
-
-    $('#gallery-load-more').remove();
-
-    function renderNextPage() {
-        const chunk = images.slice(renderIndex, renderIndex + pageSize);
-        if (chunk.length === 0) return;
-
-        const fragment = document.createDocumentFragment();
-
-        chunk.forEach((img, i) => {
-            const globalIndex = renderIndex + i;
-            const safeFolder = encodeURIComponent(folder);
-            const safeFilename = encodeURIComponent(img);
-            const url = `user/images/${safeFolder}/${safeFilename}`;
-
-            const card = document.createElement('div');
-            card.className = 'gallery-image-card interactable';
-            card.dataset.filename = img;
-            card.title = img;
-
-            // Selection checkbox
-            const checkbox = document.createElement('div');
-            checkbox.className = 'selection-checkbox';
-            card.appendChild(checkbox);
-
-            card.onclick = () => {
-                if (isSelectionMode) {
-                    toggleImageSelection(img, card);
-                } else {
-                    openImageModal(globalIndex);
-                }
-            };
-
-            const thumb = document.createElement('img');
-            thumb.src = url;
-            thumb.loading = 'lazy';
-
-            const label = document.createElement('div');
-            label.className = 'image-label';
-            label.innerText = img;
-
-            card.appendChild(thumb);
-            card.appendChild(label);
-            fragment.appendChild(card);
-        });
-
-        container.append(fragment);
-        renderIndex += pageSize;
-
-        $('#gallery-load-more').remove();
-
-        if (renderIndex < images.length) {
-            const remaining = images.length - renderIndex;
-            const loadMoreBtn = $(`
-                <button id="gallery-load-more" class="gallery-load-more-btn">
-                    <i class="fa-solid fa-plus-circle"></i> Load More (${remaining})
-                </button>
-            `);
-            loadMoreBtn.on('click', renderNextPage);
-            container.append(loadMoreBtn);
-        }
-    }
-
-    renderNextPage();
-}
-
-// ==================== Selection Mode Functions ====================
-
-function enterSelectionMode() {
-    isSelectionMode = true;
-    selectedImages.clear();
-    $('#st-image-gallery').addClass('selection-mode');
-    $('#gallery-normal-controls').hide();
-    $('#gallery-selection-controls').show();
-    updateSelectionCounter();
-}
-
-function exitSelectionMode() {
-    isSelectionMode = false;
-    selectedImages.clear();
-    $('#st-image-gallery').removeClass('selection-mode');
-    $('#gallery-normal-controls').show();
-    $('#gallery-selection-controls').hide();
-    $('#gallery-image-grid .gallery-image-card').removeClass('selected');
-}
-
-function toggleImageSelection(filename, cardElement) {
-    if (selectedImages.has(filename)) {
-        selectedImages.delete(filename);
-        $(cardElement).removeClass('selected');
-    } else {
-        selectedImages.add(filename);
-        $(cardElement).addClass('selected');
-    }
-    updateSelectionCounter();
-}
-
-function updateSelectionCounter() {
-    const count = selectedImages.size;
-    $('#selection-counter').text(`${count}개 선택`);
-
-    // Disable/enable delete and download buttons based on selection
-    if (count === 0) {
-        $('#gallery-delete-selected, #gallery-download-selected').addClass('disabled').css('opacity', '0.3');
-    } else {
-        $('#gallery-delete-selected, #gallery-download-selected').removeClass('disabled').css('opacity', '1');
-    }
-}
-
-function showDeleteConfirmModal(count, onConfirm) {
-    const modalHtml = `
-        <div id="delete-confirm-modal" class="delete-confirm-modal">
-            <div class="delete-confirm-content">
-                <h3>이미지 삭제</h3>
-                <p>${count}개의 이미지를 삭제하시겠습니까?</p>
-                <p style="color: #ff6666; font-size: 0.9em;">이 작업은 되돌릴 수 없습니다.</p>
-                <div class="delete-confirm-buttons">
-                    <button class="delete-confirm-btn cancel">취소</button>
-                    <button class="delete-confirm-btn confirm">삭제</button>
+                <div class="gallery-controls">
+                    <div class="gallery-control-group">
+                        <button id="gallery-refresh" class="icon-btn" title="Refresh"><i class="fa-solid fa-sync-alt"></i></button>
+                        <button id="gallery-go-char" class="icon-btn" title="Go to Current Character"><i class="fa-solid fa-user-circle"></i></button>
+                        <button id="gallery-upload" class="icon-btn" title="Upload Image"><i class="fa-solid fa-upload"></i></button>
+                        <input type="file" id="gallery-file-input" multiple accept="image/*,video/*" style="display:none;">
+                    </div>
+                    <div class="gallery-control-group">
+                        <button id="gallery-select-mode" class="icon-btn" title="Selection Mode"><i class="fa-solid fa-check-square"></i></button>
+                    </div>
+                    <div class="gallery-control-group selection-only" style="display:none;">
+                        <span id="gallery-selection-count">0 selected</span>
+                        <button id="gallery-select-all" class="icon-btn" title="Select All"><i class="fa-solid fa-check-double"></i></button>
+                        <button id="gallery-delete-selected" class="icon-btn warning" title="Delete Selected"><i class="fa-solid fa-trash"></i></button>
+                        <button id="gallery-cancel-selection" class="icon-btn" title="Cancel Selection"><i class="fa-solid fa-times"></i></button>
+                    </div>
+                    <div class="gallery-control-group">
+                        <button id="gallery-sort-toggle" class="icon-btn" title="Sort"><i class="fa-solid fa-sort"></i></button>
+                        <button id="gallery-close" class="icon-btn close-btn" title="Close"><i class="fa-solid fa-times"></i></button>
+                    </div>
                 </div>
             </div>
+            <div class="gallery-body">
+                <div class="gallery-sidebar">
+                    <div class="gallery-sidebar-header">Folders</div>
+                    <div id="gallery-folder-list" class="gallery-folder-list"></div>
+                </div>
+                <div class="gallery-main">
+                     <select id="gallery-mobile-folder-select" class="mobile-only"></select>
+                    <div id="gallery-grid" class="gallery-grid"></div>
+                    <div id="gallery-loader" class="gallery-loader"><i class="fa-solid fa-spinner fa-spin"></i></div>
+                    <div id="gallery-empty" class="gallery-empty" style="display:none;">No images found in this folder.</div>
+                </div>
+            </div>
+             <!-- Handle removed from HTML, added via jQuery UI automatically, but keeping div if you used custom CSS for it -->
+             <div class="gallery-resize-handle"></div>
         </div>
     `;
 
-    $('body').append(modalHtml);
+    $('body').append(html);
+    
+    // Position
+    const $win = $('#ct-gallery-explorer');
+    const rect = galleryState.galleryRect;
+    
+    // Z-Index Handling
+    const wins = Array.from(document.querySelectorAll('div')).map(e => Number(getComputedStyle(e).zIndex) || 0);
+    const highest = Math.max(2000, ...wins);
+    const newIndex = Math.min(99900, highest + 1);
+    $win.css('z-index', newIndex);
+    
+    // Only apply absolute positioning on non-mobile
+    if (!isMobile()) {
+        $win.css({
+            top: rect.top,
+            left: rect.left,
+            width: rect.width,
+            height: rect.height,
+            position: 'fixed'
+        });
+        
+        // Draggable
+        $win.draggable({
+            handle: '.gallery-header',
+            containment: 'window',
+            start: () => {
+                // Disable blur during drag to prevent lag
+                $win.addClass('resizing');
+            },
+            stop: (e, ui) => {
+                $win.removeClass('resizing');
+                galleryState.galleryRect.top = ui.position.top;
+                galleryState.galleryRect.left = ui.position.left;
+                saveUiState();
+            }
+        });
 
-    $('#delete-confirm-modal .cancel').on('click', () => {
-        $('#delete-confirm-modal').remove();
+        // Resizable
+        $win.resizable({
+            handles: 'n, e, s, w, ne, se, sw, nw',
+            minHeight: 400,
+            minWidth: 500,
+            // PERFORMANCE FIX: Disable heavy CSS effects during resize interaction
+            start: (e, ui) => {
+                $win.addClass('resizing');
+            },
+            stop: (e, ui) => {
+                $win.removeClass('resizing');
+                galleryState.galleryRect.width = ui.size.width;
+                galleryState.galleryRect.height = ui.size.height;
+                saveUiState();
+            }
+        });
+        
+        // Bring to front on click
+         $win.on('mousedown', () => {
+             const wins = Array.from(document.querySelectorAll('.ct-gallery-window, .ui-dialog, .drawer-content')).map(e => Number(getComputedStyle(e).zIndex) || 0);
+             const highest = Math.max(2000, ...wins);
+             const newIndex = Math.min(99900, highest + 1);
+             $win.css('z-index', newIndex);
+         });
+    }
+
+    // Event Listeners
+    $('#gallery-close').on('click', closeGallery);
+    $('#gallery-refresh').on('click', () => loadFolder(galleryState.currentFolder));
+    $('#gallery-go-char').on('click', syncToCurrentCharacter);
+    $('#gallery-sort-toggle').on('click', toggleSort);
+    
+    $('#gallery-mobile-folder-select').on('change', function() {
+        loadFolder($(this).val());
     });
+    
+    // Upload
+    $('#gallery-upload').on('click', () => $('#gallery-file-input').click());
+    $('#gallery-file-input').on('change', handleUpload);
+    
+    // Selection Mode
+    $('#gallery-select-mode').on('click', toggleSelectionMode);
+    $('#gallery-cancel-selection').on('click', toggleSelectionMode);
+    $('#gallery-select-all').on('click', selectAll);
+    $('#gallery-delete-selected').on('click', deleteSelected);
 
-    $('#delete-confirm-modal .confirm').on('click', () => {
-        $('#delete-confirm-modal').remove();
-        onConfirm();
+    // Handle Resize / Breakpoint changes
+    $(window).on('resize.ctgallery', () => {
+        const $win = $('#ct-gallery-explorer');
+        if (!$win.is(':visible')) return;
+
+        // BUG FIX: Don't forcefully reset dimensions if the user is currently resizing the gallery
+        if ($win.hasClass('ui-resizable-resizing') || $win.hasClass('ui-draggable-dragging')) return;
+
+        if (isMobile()) {
+            $win.css({ width: '', height: '', top: '', left: '' });
+        } else {
+            // Only restore saved position if we are switching from mobile to desktop
+            // or if the window resized drastically.
+            const rect = galleryState.galleryRect;
+            const safeRect = ensureOnScreen(rect, 800, 600);
+            
+            // Apply only position, let width/height stay relative if possible, or enforce safe rect
+            $win.css({
+                top: safeRect.top,
+                left: safeRect.left,
+                width: safeRect.width,
+                height: safeRect.height,
+                position: 'fixed'
+            });
+            
+            // Re-enable if needed
+            if ($win.data('ui-draggable')) $win.draggable('enable');
+            if ($win.data('ui-resizable')) $win.resizable('enable');
+        }
     });
 }
 
-async function deleteSelectedImages() {
-    if (selectedImages.size === 0) return;
-
-    showDeleteConfirmModal(selectedImages.size, async () => {
-        const toDelete = Array.from(selectedImages);
-        let successCount = 0;
-        let failCount = 0;
-
-        for (const filename of toDelete) {
-            try {
-                const relativePath = `user/images/${currentFolder}/${filename}`;
-                await apiPost('/api/images/delete', { path: relativePath });
-                successCount++;
-            } catch (e) {
-                console.error(`Failed to delete ${filename}:`, e);
-                failCount++;
-            }
-        }
-
-        if (window.toastr) {
-            if (failCount === 0) {
-                toastr.success(`${successCount}개의 이미지가 삭제되었습니다.`);
-            } else {
-                toastr.warning(`${successCount}개 삭제됨, ${failCount}개 실패`);
-            }
-        }
-
-        exitSelectionMode();
-        loadImages(currentFolder);
-    });
+function isMobile() {
+    return window.matchMedia("(max-width: 768px)").matches;
 }
 
-async function downloadSelectedImages() {
-    if (selectedImages.size === 0) return;
-
-    const toDownload = Array.from(selectedImages);
-
-    for (const filename of toDownload) {
-        try {
-            const safeFolder = encodeURIComponent(currentFolder);
-            const safeFilename = encodeURIComponent(filename);
-            const imageUrl = `user/images/${safeFolder}/${safeFilename}`;
-
-            const response = await fetch(imageUrl);
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-
-            setTimeout(() => {
-                window.URL.revokeObjectURL(url);
-                document.body.removeChild(a);
-            }, 100);
-
-            // Small delay between downloads to prevent browser blocking
-            await new Promise(resolve => setTimeout(resolve, 200));
-        } catch (e) {
-            console.error(`Failed to download ${filename}:`, e);
+async function openGallery(targetFolder = null) {
+    if (!$('#ct-gallery-explorer').length) buildGalleryWindow();
+    
+    const $win = $('#ct-gallery-explorer');
+    $win.show();
+    
+    // Initialize
+    await refreshFolderList();
+    
+    // Determine folder
+    let folder = targetFolder || galleryState.currentFolder;
+    if (!folder) {
+        // Try to sync with current character
+        const context = getContext();
+        if (context.characterId !== undefined && context.characters[context.characterId]) {
+            folder = context.characters[context.characterId].name;
+            // Also try to find avatar specific folder if needed, but usually Name is good
         }
     }
-
-    if (window.toastr) {
-        toastr.success(`${toDownload.length}개의 이미지 다운로드 완료`);
+    
+    if (folder) {
+        loadFolder(folder);
+    } else {
+        // Default to first folder if available
+        const first = $('#gallery-folder-list .folder-item').first().data('folder');
+        if (first) loadFolder(first);
     }
+}
 
+function closeGallery() {
+    $('#ct-gallery-explorer').hide();
     exitSelectionMode();
 }
 
-// ==================== End Selection Mode Functions ====================
+async function refreshFolderList() {
+    const folders = await fetchFolders();
+    const $list = $('#gallery-folder-list');
+    const $mobile = $('#gallery-mobile-folder-select');
+    
+    $list.empty();
+    $mobile.empty();
+    
+    folders.forEach(f => {
+        const sortedF = f; 
+        $list.append(`<div class="folder-item interactable" data-folder="${f}"><i class="fa-solid fa-folder"></i> ${f}</div>`);
+        $mobile.append(`<option value="${f}">${f}</option>`);
+    });
+    
+    // Click handlers
+    $list.find('.folder-item').on('click', function() {
+        loadFolder($(this).data('folder'));
+    });
+}
 
-function createGalleryWindow() {
-    if ($('#st-image-gallery').length) {
-        const $gallery = $('#st-image-gallery');
-        $gallery.show().css('display', 'flex');
-        bringToFront($gallery);
+async function loadFolder(folder) {
+    if (!folder) return;
+    galleryState.currentFolder = folder;
+    
+    // Update UI
+    $('#gallery-folder-list .folder-item').removeClass('active');
+    $(`#gallery-folder-list .folder-item[data-folder="${folder}"]`).addClass('active');
+    $('#gallery-mobile-folder-select').val(folder);
+    
+    $('#gallery-loader').show();
+    $('#gallery-grid').empty();
+    $('#gallery-empty').hide();
+    
+    const settings = extension_settings[extensionName];
+    let images = await fetchImages(folder);
+    images = sortImages(images, settings.sortOrder);
+    galleryState.images = images;
+    
+    $('#gallery-loader').hide();
+    
+    if (images.length === 0) {
+        $('#gallery-empty').show();
         return;
     }
+    
+    renderGrid(images);
+}
 
-    const galleryHtml = `
-        <div id="st-image-gallery" class="st-gallery-window" style="display:none;">
-            <div class="gallery-header">
-                <span class="gallery-title">이미지 갤러리</span>
-                <div class="gallery-controls" id="gallery-normal-controls">
-                    <i id="gallery-select" class="fa-solid fa-check-square" title="Selection Mode"></i>
-                    <i id="gallery-go-char" class="fa-solid fa-user-circle" title="Go to Current Character"></i>
-                    <i id="gallery-sort" class="fa-solid fa-sort-amount-down" title="Sort Order: Newest First"></i>
-                    <i id="gallery-refresh" class="fa-solid fa-sync-alt" title="Refresh"></i>
-                    <i id="gallery-close" class="fa-solid fa-times" title="Close"></i>
-                </div>
-                <div class="gallery-controls selection-controls" id="gallery-selection-controls" style="display:none;">
-                    <span class="selection-counter" id="selection-counter">0개 선택</span>
-                    <i id="gallery-select-all" class="fa-solid fa-check-double" title="Select All"></i>
-                    <i id="gallery-download-selected" class="fa-solid fa-download" title="Download Selected"></i>
-                    <i id="gallery-delete-selected" class="fa-solid fa-trash warning" title="Delete Selected"></i>
-                    <i id="gallery-cancel-select" class="fa-solid fa-times" title="Cancel Selection"></i>
-                </div>
+function renderGrid(images) {
+    const $grid = $('#gallery-grid');
+    const folder = galleryState.currentFolder;
+    
+    const fragment = document.createDocumentFragment();
+    
+    images.forEach((filename, index) => {
+        const item = document.createElement('div');
+        item.className = 'gallery-item';
+        item.dataset.index = index;
+        item.dataset.filename = filename;
+        
+        const isVideo = /\.(mp4|webm|ogg|mov)$/i.test(filename);
+        const url = `user/images/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
+        
+        item.innerHTML = `
+            <div class="gallery-thumb-container">
+                ${isVideo ? `<div class="video-badges"><i class="fa-solid fa-video"></i></div>` : ''}
+                <img src="${url}" loading="lazy" class="gallery-thumb">
+                <div class="gallery-selection-checkbox"><i class="fa-solid fa-check"></i></div>
             </div>
-            <div class="gallery-content">
-            <div class="gallery-content">
-                <select id="gallery-mobile-folder-select" style="display:none;"></select>
-                <div id="gallery-folder-list" class="gallery-sidebar"></div>
-                <div id="gallery-sidebar-resizer" class="gallery-sidebar-resizer"></div>
-                <div id="gallery-image-grid" class="gallery-grid"></div>
-                <div id="gallery-loading-indicator" class="gallery-loading" style="display:none;">
-                    <i class="fa-solid fa-spinner fa-spin"></i>
+            <div class="gallery-item-name">${filename}</div>
+        `;
+        
+        // Events
+        item.addEventListener('click', (e) => onGalleryItemClick(e, index, filename));
+        
+        fragment.appendChild(item);
+    });
+    
+    $grid.append(fragment);
+    updateSelectionUI();
+}
+
+function toggleSort() {
+    const settings = extension_settings[extensionName];
+    const orders = ['newest', 'oldest', 'nameAsc', 'nameDesc'];
+    let idx = orders.indexOf(settings.sortOrder);
+    idx = (idx + 1) % orders.length;
+    settings.sortOrder = orders[idx];
+    settings.sortOrder = orders[idx]; // Persist?
+    
+    const icon = {
+        'newest': 'fa-sort-numeric-down',
+        'oldest': 'fa-sort-numeric-up',
+        'nameAsc': 'fa-sort-alpha-down',
+        'nameDesc': 'fa-sort-alpha-up'
+    }[settings.sortOrder];
+    
+    $('#gallery-sort-toggle i').attr('class', `fa-solid ${icon}`);
+    toastr.info(`Sorting: ${settings.sortOrder}`);
+    
+    loadFolder(galleryState.currentFolder); // Reload and sort
+    saveSettingsDebounced();
+}
+
+// --- Selection Mode ---
+
+function toggleSelectionMode() {
+    galleryState.selectionMode = !galleryState.selectionMode;
+    const $win = $('#ct-gallery-explorer');
+    
+    if (galleryState.selectionMode) {
+        $win.addClass('selection-active');
+        $win.find('.selection-only').show();
+        $win.find('#gallery-select-mode').addClass('active');
+    } else {
+        exitSelectionMode();
+    }
+}
+
+function exitSelectionMode() {
+    galleryState.selectionMode = false;
+    galleryState.selectedImages.clear();
+    const $win = $('#ct-gallery-explorer');
+    $win.removeClass('selection-active');
+    $win.find('.selection-only').hide();
+    $win.find('#gallery-select-mode').removeClass('active');
+    $('.gallery-item').removeClass('selected');
+    updateSelectionUI();
+}
+
+function selectAll() {
+    const all = galleryState.images;
+    if (galleryState.selectedImages.size === all.length) {
+        galleryState.selectedImages.clear();
+        $('.gallery-item').removeClass('selected');
+    } else {
+        all.forEach(img => galleryState.selectedImages.add(img));
+        $('.gallery-item').addClass('selected');
+    }
+    updateSelectionUI();
+}
+
+function onGalleryItemClick(e, index, filename) {
+    if (galleryState.selectionMode) {
+        if (galleryState.selectedImages.has(filename)) {
+            galleryState.selectedImages.delete(filename);
+            $(e.currentTarget).removeClass('selected');
+        } else {
+            galleryState.selectedImages.add(filename);
+            $(e.currentTarget).addClass('selected');
+        }
+        updateSelectionUI();
+    } else {
+        openLightbox(index);
+    }
+}
+
+function updateSelectionUI() {
+    $('#gallery-selection-count').text(`${galleryState.selectedImages.size} selected`);
+}
+
+async function deleteSelected() {
+    const count = galleryState.selectedImages.size;
+    if (count === 0) return;
+    
+    if (!confirm(`Are you sure you want to delete ${count} item(s)?`)) return;
+    
+    const context = getContext();
+    const folder = galleryState.currentFolder;
+    
+    let deleted = 0;
+    for (const filename of galleryState.selectedImages) {
+        const path = `user/images/${folder}/${filename}`;
+        const result = await deleteImageAPI(path);
+        if (result) deleted++;
+    }
+    
+    toastr.success(`Deleted ${deleted} images.`);
+    exitSelectionMode();
+    loadFolder(folder);
+}
+
+// --- Lightbox ---
+
+function openLightbox(index) {
+    if (index < 0 || index >= galleryState.images.length) return;
+    
+    galleryState.selectedIndex = index;
+    
+    if ($('#ct-gallery-lightbox').length === 0) {
+        buildLightbox();
+    }
+    
+    const $lb = $('#ct-gallery-lightbox');
+    $lb.show();
+    updateLightboxContent();
+}
+
+function buildLightbox() {
+    // ST-Native-like structure using SmartTheme classes
+    const html = `
+        <div id="ct-gallery-lightbox" class="ct-gallery-lightbox">
+            <div class="lb-backdrop"></div>
+            <div class="lb-window">
+                <div class="lb-header">
+                    <div class="lb-title">
+                        <span class="lb-counter"></span>
+                        <span class="lb-filename"></span>
+                    </div>
+                    <div class="lb-controls">
+                        <div class="lb-control-item lb-download" title="Download"><i class="fa-solid fa-download"></i></div>
+                        <div class="lb-control-item lb-delete warning" title="Delete"><i class="fa-solid fa-trash"></i></div>
+                        <div class="lb-control-item lb-close" title="Close"><i class="fa-solid fa-times"></i></div>
+                    </div>
                 </div>
-            </div>
-            </div>
+                <div class="lb-content">
+                    <div class="lb-nav lb-prev"><i class="fa-solid fa-chevron-left"></i></div>
+                    <div class="lb-media-container"></div>
+                    <div class="lb-nav lb-next"><i class="fa-solid fa-chevron-right"></i></div>
+                </div>
             </div>
         </div>
     `;
-
-    $('body').append(galleryHtml);
-    const $gallery = $('#st-image-gallery');
-
-    if (window.ResizeObserver) {
-        const resizeObserver = new ResizeObserver(entries => {
-            for (let entry of entries) {
-                if (entry.contentRect.width < 600) {
-                    $gallery.addClass('st-gallery-compact');
-                } else {
-                    $gallery.removeClass('st-gallery-compact');
-                }
-            }
-        });
-        resizeObserver.observe($gallery[0]);
-
-        $gallery.on('remove', () => {
-            resizeObserver.disconnect();
-        });
-    }
-
-    const rect = ensureOnScreen(galleryRect, 800, 600);
-
-    const isMobile = window.matchMedia("(max-width: 768px)").matches;
-
-    if (!isMobile) {
-        $gallery.css({
-            width: rect.width + 'px',
-            height: rect.height + 'px',
-            left: rect.left + 'px',
-            top: rect.top + 'px',
-            display: 'flex'
-        });
-    } else {
-        $gallery.css({ display: 'flex' });
-    }
-
-    if (!isMobile) {
-        $gallery.draggable({
-            handle: '.gallery-header',
-            containment: 'window',
-            start: function () { bringToFront($(this)); },
-            stop: function (event, ui) {
-                galleryRect = {
-                    top: ui.position.top,
-                    left: ui.position.left,
-                    width: $gallery.width(),
-                    height: $gallery.height()
-                };
-                saveState();
-            }
-        }).resizable({
-            handles: 'n, e, s, w, ne, se, sw, nw',
-            minHeight: 300,
-            minWidth: 400,
-            stop: function (event, ui) {
-                galleryRect = {
-                    top: ui.position.top,
-                    left: ui.position.left,
-                    width: ui.size.width,
-                    height: ui.size.height
-                };
-                saveState();
-            }
-        });
-
-        $gallery.on('mousedown', function () {
-            bringToFront($(this));
-        });
-        bringToFront($gallery);
-    }
-
-    const $resizer = $('#gallery-sidebar-resizer');
-    const $sidebar = $('#gallery-folder-list');
-
-    $resizer.on('mousedown', function (e) {
-        e.preventDefault();
-        const startX = e.clientX;
-        const startWidth = $sidebar.width();
-
-        $(document).on('mousemove.sidebar-resize', function (e) {
-            const newWidth = startWidth + (e.clientX - startX);
-            if (newWidth > 100 && newWidth < 400) {
-                $sidebar.width(newWidth);
-            }
-        });
-
-        $(document).on('mouseup.sidebar-resize', function () {
-            $(document).off('mousemove.sidebar-resize');
-            $(document).off('mouseup.sidebar-resize');
-        });
+    $('body').append(html);
+    
+    // Explicit high Z-Index
+    $('#ct-gallery-lightbox').css('z-index', 2147483647);
+    
+    $('.lb-close, .lb-backdrop').on('click', () => $('#ct-gallery-lightbox').hide());
+    $('.lb-prev').on('click', (e) => { e.stopPropagation(); navigateLightbox(-1); });
+    $('.lb-next').on('click', (e) => { e.stopPropagation(); navigateLightbox(1); });
+    // Prevent double-click selection on rapid navigation
+    $('.lb-nav, .lb-control-item').on('mousedown', (e) => e.preventDefault());
+    
+    $('.lb-delete').on('click', (e) => { e.stopPropagation(); deleteCurrentLightboxImage(); });
+    $('.lb-download').on('click', (e) => { e.stopPropagation(); downloadCurrentLightboxImage(); });
+    
+    // Keyboard navigation
+    $(document).on('keydown.ctgallery', (e) => {
+        if (!$('#ct-gallery-lightbox').is(':visible')) return;
+        if (e.key === 'ArrowLeft') navigateLightbox(-1);
+        if (e.key === 'ArrowRight') navigateLightbox(1);
+        if (e.key === 'Escape') $('#ct-gallery-lightbox').hide();
+        if (e.key === 'Delete') deleteCurrentLightboxImage();
     });
-
-    function shutdownGallery() {
-        if (activeXhr) {
-            activeXhr.abort();
-            activeXhr = null;
-        }
-        if (renderReqId) {
-            cancelAnimationFrame(renderReqId);
-            renderReqId = null;
-        }
-        // Reset selection mode state
-        isSelectionMode = false;
-        selectedImages.clear();
-        $('#st-image-gallery').remove();
-    }
-
-    $('#gallery-close').off('click').on('click', shutdownGallery);
-    $('#gallery-refresh').on('click', () => {
-        if (currentFolder) loadImages(currentFolder);
-        else loadFolders();
-    });
-
-    $('#gallery-sort').on('click', function () {
-        sortOrder = sortOrder === 'newest' ? 'oldest' : 'newest';
-        const isNewest = sortOrder === 'newest';
-
-        $(this).attr('title', `Sort Order: ${isNewest ? 'Newest First' : 'Oldest First'}`);
-
-        $(this).removeClass('fa-sort-amount-down fa-sort-amount-up');
-        $(this).addClass(isNewest ? 'fa-sort-amount-down' : 'fa-sort-amount-up');
-
-        if (currentImages.length > 0) {
-            const sorted = sortImages(currentImages);
-            renderImages(sorted, currentFolder);
-        }
-    });
-
-    $('#gallery-go-char').on('click', () => {
-        syncToCurrentCharacter();
-    });
-
-    $('#gallery-mobile-folder-select').on('change', function () {
-        const selected = $(this).val();
-        if (selected) loadImages(selected);
-    });
-
-    // Selection Mode Event Handlers
-    $('#gallery-select').on('click', () => enterSelectionMode());
-    $('#gallery-cancel-select').on('click', () => exitSelectionMode());
-
-    $('#gallery-select-all').on('click', () => {
-        const allCards = $('#gallery-image-grid .gallery-image-card');
-        if (selectedImages.size === currentImages.length) {
-            // Deselect all
-            selectedImages.clear();
-            allCards.removeClass('selected');
-        } else {
-            // Select all
-            currentImages.forEach(img => selectedImages.add(img));
-            allCards.addClass('selected');
-        }
-        updateSelectionCounter();
-    });
-
-    $('#gallery-delete-selected').on('click', () => deleteSelectedImages());
-    $('#gallery-download-selected').on('click', () => downloadSelectedImages());
-
-    loadFolders();
-
-    if (currentFolder) {
-        loadImages(currentFolder);
-    } else {
-        syncToCurrentCharacter();
-    }
-}
-
-function syncToCurrentCharacter() {
-    const context = SillyTavern.getContext();
-    console.log('Gallery Sync: Context', context);
-
-    if (context && context.characterId !== undefined) {
-        let charName = context.name2;
-
-        if (!charName && context.characters && context.characters[context.characterId]) {
-            charName = context.characters[context.characterId].name;
-        }
-
-        if (charName) {
-            console.log('Gallery Sync: Target:', charName);
-            loadImages(charName);
-        } else {
-            console.warn('Gallery Sync: Character ID present but Name resolved to null');
-            if (currentFolder === '') loadFolders();
-        }
-    } else {
-        console.log('Gallery Sync: No character selected');
-        if (currentFolder === '') loadFolders();
-    }
-}
-
-function openGallery() {
-    createGalleryWindow();
-}
-
-function openImageModal(index) {
-    if (index < 0 || index >= currentImages.length) return;
-    currentImageIndex = index;
-    const filename = currentImages[index];
-    const safeFolder = encodeURIComponent(currentFolder);
-    const safeFilename = encodeURIComponent(filename);
-    const imageUrl = `user/images/${safeFolder}/${safeFilename}`;
-
-    const modalId = 'st-image-viewer';
-
-    let $modal = $('#' + modalId);
-    if ($modal.length === 0) {
-        let modalHtml = `
-            <div id="${modalId}" class="st-gallery-window image-viewer-window" style="display:none;">
-                <div class="gallery-header">
-                    <div class="gallery-title" id="viewer-title">${filename}</div>
-                    <div class="gallery-controls">
-                        <!-- Controls -->
-                        <i class="fa-solid fa-expand interactable" id="viewer-toggle-fit" title="Toggle Size (Fit/Original)"></i>
-                        <span class="separator" style="margin: 0 5px; opacity: 0.3;">|</span>
-                        <i class="fa-solid fa-download interactable" id="viewer-download" title="Download"></i>
-                        <i class="fa-solid fa-trash interactable warning" id="viewer-delete" title="Delete"></i>
-                        <i class="fa-solid fa-times interactable" id="viewer-close" title="Close"></i>
-                    </div>
-                </div>
-                <div class="viewer-content">
-                    <div class="viewer-nav-btn prev" id="viewer-prev"><i class="fa-solid fa-chevron-left"></i></div>
-                    <div class="viewer-msg" id="viewer-msg"></div>
-                    <img src="${imageUrl}" id="viewer-image" draggable="false">
-                    <div class="viewer-nav-btn next" id="viewer-next"><i class="fa-solid fa-chevron-right"></i></div>
-                </div>
-            </div>
-        `;
-
-        if (window.matchMedia("(max-width: 768px)").matches) {
-            modalHtml = modalHtml.replace(/<div class="viewer-nav-btn.*?<\/div>/g, '');
-        }
-
-        $('body').append(modalHtml);
-        $modal = $('#' + modalId);
-
-
-        const rect = ensureOnScreen(viewerRect, 600, 700);
-
-        $modal.css({
-            width: rect.width + 'px',
-            height: rect.height + 'px',
-            left: rect.left + 'px',
-            top: rect.top + 'px',
-            display: 'flex'
-        });
-
-        $modal.draggable({
-            handle: '.gallery-header',
-            containment: 'window',
-            stop: function (event, ui) {
-                viewerRect = {
-                    top: ui.position.top,
-                    left: ui.position.left,
-                    width: $modal.width(),
-                    height: $modal.height()
-                };
-                saveState();
-            }
-        }).resizable({
-            minHeight: 300,
-            minWidth: 300,
-            stop: function (event, ui) {
-                viewerRect = {
-                    top: ui.position.top,
-                    left: ui.position.left,
-                    width: ui.size.width,
-                    height: ui.size.height
-                };
-                saveState();
-            }
-        });
-
-        $('#viewer-close').on('click', () => $modal.remove());
-
-        if (window.matchMedia("(max-width: 768px)").matches) {
-            $modal.find('.viewer-nav-btn').hide();
-        }
-
-        $(document).on('keydown.viewer', function (e) {
-            if ($('#' + modalId).length === 0) {
-                $(document).off('keydown.viewer');
-                return;
-            }
-            if (e.key === 'ArrowLeft') $('#viewer-prev').click();
-            if (e.key === 'ArrowRight') $('#viewer-next').click();
-            if (e.key === 'Escape') $modal.remove();
-        });
-
-    } else {
-        $modal.find('#viewer-image').attr('src', imageUrl);
-        $modal.find('#viewer-title').text(filename);
-    }
-
-    const navigateImage = (offset) => {
-        let newIndex = currentImageIndex + offset;
-        if (newIndex < 0) newIndex = currentImages.length - 1;
-        if (newIndex >= currentImages.length) newIndex = 0;
-        openImageModal(newIndex);
-    };
-
-    $('#viewer-prev').off('click').on('click', () => navigateImage(-1));
-    $('#viewer-next').off('click').on('click', () => navigateImage(1));
-
-    setupImageInteractions($modal, imageUrl, filename, navigateImage);
-}
-
-function setupImageInteractions($modal, imageUrl, filename, navigateImage) {
-    const img = $modal.find('#viewer-image');
-    const content = $modal.find('.viewer-content');
-
-    let state = {
-        scale: 1,
-        translateX: 0,
-        translateY: 0,
-        isDragging: false,
-        startX: 0,
-        startY: 0,
-        lastX: 0,
-        lastY: 0,
-        initialPinchDistance: 0,
-        initialScale: 1
-    };
-
-    let isRenderPending = false;
-    const render = () => {
-        if (!isRenderPending) {
-            requestAnimationFrame(() => {
-                img.css('transform', `translate(${state.translateX}px, ${state.translateY}px) scale(${state.scale})`);
-                if (state.isDragging || state.scale !== 1) {
-                    img.css('will-change', 'transform');
-                } else {
-                    img.css('will-change', 'auto');
-                }
-                isRenderPending = false;
-            });
-            isRenderPending = true;
-        }
-    };
-
-    render();
-
-    content.off('mousedown.viewer').on('mousedown.viewer', function (e) {
-        if ($(e.target).closest('.viewer-nav-btn').length) return;
-        e.preventDefault();
-
-        state.isDragging = true;
-        state.startX = e.clientX - state.translateX;
-        state.startY = e.clientY - state.translateY;
-        content.css('cursor', 'grabbing');
-    });
-
-    $(document).off('mousemove.viewer').on('mousemove.viewer', function (e) {
-        if (state.isDragging) {
-            state.translateX = e.clientX - state.startX;
-            state.translateY = e.clientY - state.startY;
-            render();
-        }
-    });
-
-    $(document).off('mouseup.viewer').on('mouseup.viewer', function () {
-
-        if (state.isDragging) {
-            state.isDragging = false;
-            content.css('cursor', 'default');
-        }
-    });
-
-    // --- Double Click Zoom (PC) ---
-    content.off('dblclick.viewer').on('dblclick.viewer', function (e) {
-        if ($(e.target).closest('.viewer-nav-btn').length) return;
-        e.preventDefault();
-
-        if (Math.abs(state.scale - 1) < 0.1) {
-            state.scale = 2; // Fixed 2x zoom
-        } else {
-            state.scale = 1;
-            state.translateX = 0;
-            state.translateY = 0;
-        }
-        render();
-    });
-
-
-    const doubleTapDelay = 300;
-
-    let lastTapTime = 0;
+    
+    // Gestures (Basic touch)
     let touchStartX = 0;
-    let touchStartY = 0;
-
-
-    const swipeThreshold = 30;
-
-    content.off('touchstart.viewer').on('touchstart.viewer', function (e) {
-        if ($(e.target).closest('.viewer-nav-btn').length) return;
-
-        const touches = e.touches;
-
-        if (touches.length === 1) {
-            const currentTime = new Date().getTime();
-            const tapLength = currentTime - lastTapTime;
-
-            if (tapLength < doubleTapDelay && tapLength > 0) {
-                e.preventDefault();
-                if (Math.abs(state.scale - 1) < 0.1) {
-                    state.scale = 2;
-                } else {
-                    state.scale = 1;
-                    state.translateX = 0;
-                    state.translateY = 0;
-                }
-                render();
-                return;
-            }
-            lastTapTime = currentTime;
-
-            touchStartX = touches[0].clientX;
-            touchStartY = touches[0].clientY;
-
-            state.isDragging = true;
-            state.dragStartOffsetX = touches[0].clientX - state.translateX;
-            state.dragStartOffsetY = touches[0].clientY - state.translateY;
-
-        } else if (touches.length === 2) {
-            state.isDragging = false;
-            state.initialPinchDistance = Math.hypot(
-                touches[0].clientX - touches[1].clientX,
-                touches[0].clientY - touches[1].clientY
-            );
-            state.initialScale = state.scale;
-        }
+    $('.lb-content').on('touchstart', (e) => {
+        touchStartX = e.touches[0].clientX;
+    }).on('touchend', (e) => {
+        const touchEndX = e.changedTouches[0].clientX;
+        if (touchStartX - touchEndX > 50) navigateLightbox(1);
+        if (touchEndX - touchStartX > 50) navigateLightbox(-1);
     });
-
-    content.off('touchmove.viewer').on('touchmove.viewer', function (e) {
-        e.preventDefault();
-
-        const touches = e.touches;
-
-        if (touches.length === 1 && state.isDragging) {
-
-            if (state.scale > 1.05) {
-                state.translateX = touches[0].clientX - state.dragStartOffsetX;
-                state.translateY = touches[0].clientY - state.dragStartOffsetY;
-            } else {
-                const computedX = touches[0].clientX - state.dragStartOffsetX;
-
-                state.translateX = computedX;
-                state.translateY = 0;
-            }
-            render();
-
-        } else if (touches.length === 2) {
-            const currentDistance = Math.hypot(
-                touches[0].clientX - touches[1].clientX,
-                touches[0].clientY - touches[1].clientY
-            );
-
-            if (state.initialPinchDistance > 0) {
-                const newScale = state.initialScale * (currentDistance / state.initialPinchDistance);
-                state.scale = Math.max(0.1, Math.min(newScale, 5));
-                render();
-            }
-        }
-    });
-
-    content.off('touchend.viewer').on('touchend.viewer', function (e) {
-        if (e.touches.length === 0) {
-            state.isDragging = false;
-
-            if (state.scale <= 1.05) {
-
-                const diffX = state.translateX;
-
-                if (Math.abs(diffX) > swipeThreshold) {
-                    if (diffX > 0) {
-                        if (navigateImage) navigateImage(-1);
-                    } else {
-                        if (navigateImage) navigateImage(1);
-                    }
-                    state.translateX = 0;
-                } else {
-                    state.translateX = 0;
-                    render();
-                }
-            } else {
-            }
-
-        } else if (e.touches.length === 1) {
-            state.dragStartOffsetX = e.touches[0].clientX - state.translateX;
-            state.dragStartOffsetY = e.touches[0].clientY - state.translateY;
-            state.isDragging = true;
-        }
-    });
-
-    content.off('wheel.viewer').on('wheel.viewer', function (e) {
-        e.preventDefault();
-        const delta = e.originalEvent.deltaY > 0 ? -0.1 : 0.1;
-        state.scale = Math.max(0.1, Math.min(state.scale + delta, 5));
-        render();
-    });
-
-    $modal.on('mousedown', function () {
-        bringToFront($modal);
-    });
-
-    bringToFront($modal);
-
-    $modal.find('#viewer-toggle-fit').off('click').on('click', function () {
-        const $icon = $(this);
-        const domImg = img[0];
-
-        const isCurrentlyFitted = Math.abs(state.scale - 1) < 0.05;
-
-        if (isCurrentlyFitted) {
-            if (domImg.naturalWidth && domImg.width) {
-                const naturalRatio = domImg.naturalWidth / domImg.naturalHeight;
-                const containerRatio = domImg.width / domImg.height;
-
-                let paintedWidth;
-                if (containerRatio > naturalRatio) {
-                    paintedWidth = domImg.height * naturalRatio;
-                } else {
-                    paintedWidth = domImg.width;
-                }
-
-                state.scale = domImg.naturalWidth / paintedWidth;
-                state.translateX = 0;
-                state.translateY = 0;
-                render();
-
-                $icon.removeClass('fa-expand').addClass('fa-compress');
-            }
-        } else {
-            state.scale = 1;
-            state.translateX = 0;
-            state.translateY = 0;
-            render();
-
-            $icon.removeClass('fa-compress').addClass('fa-expand');
-        }
-    });
-
-    $modal.find('#viewer-download').off('click').on('click', async () => {
-        try {
-            const response = await fetch(imageUrl);
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-
-            const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-
-            setTimeout(() => {
-                window.URL.revokeObjectURL(url);
-                document.body.removeChild(a);
-            }, 100);
-        } catch (e) {
-            console.error('Download failed, falling back to direct link', e);
-            const a = document.createElement('a');
-            a.href = imageUrl;
-            a.download = filename;
-            a.target = '_blank';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-        }
-    });
-
-    $modal.find('#viewer-delete').off('click').on('click', async () => {
-        if (confirm('Are you sure you want to delete this image?')) {
-            try {
-
-                const relativePath = `user/images/${currentFolder}/${filename}`;
-
-                await apiPost('/api/images/delete', { path: relativePath });
-
-                currentImages.splice(currentImageIndex, 1);
-                if (currentImages.length === 0) {
-                    $modal.remove();
-                    loadImages(currentFolder);
-                } else {
-                    if (currentImageIndex >= currentImages.length) currentImageIndex = currentImages.length - 1;
-                    openImageModal(currentImageIndex);
-                    loadImages(currentFolder);
-                }
-                if (window.toastr) toastr.success('Image deleted');
-            } catch (e) {
-                console.error("Delete failed", e);
-                alert('Failed to delete image: ' + (e.message || e));
-            }
-        }
-    });
-
-    const resizeObserver = new ResizeObserver(() => {
-        render();
-    });
-    resizeObserver.observe($modal[0]);
-
-    $modal.on('remove', () => resizeObserver.disconnect());
 }
 
-window.openGallery = openGallery;
-
-jQuery(async () => {
-    if (window.SlashCommandParser && window.SlashCommandParser.addCommandObject) {
-        window.SlashCommandParser.addCommandObject(window.SlashCommandParser.commands.createCommandObject(
-            'gallery',
-            {},
-            () => { openGallery(); return "Opening Gallery..."; },
-            'Open Image Gallery'
-        ));
+function updateLightboxContent() {
+    const index = galleryState.selectedIndex;
+    const filename = galleryState.images[index];
+    const folder = galleryState.currentFolder;
+    const url = `user/images/${encodeURIComponent(folder)}/${encodeURIComponent(filename)}`;
+    const isVideo = /\.(mp4|webm|ogg|mov)$/i.test(filename);
+    
+    const $container = $('.lb-media-container');
+    $container.empty();
+    
+    if (isVideo) {
+        const $video = $(`<video src="${url}" controls autoplay class="lb-media"></video>`);
+        $container.append($video);
+    } else {
+        const $img = $(`<img src="${url}" class="lb-media">`);
+        $container.append($img);
+        
+        // Reset Zoom
+        // Implement zoom/pan logic if needed, for now standard css fit
     }
+    
+    $('.lb-counter').text(`${index + 1} / ${galleryState.images.length}`);
+    $('.lb-filename').text(filename);
+}
 
-    const addGalleryButton = () => {
+function navigateLightbox(dir) {
+    let newIndex = galleryState.selectedIndex + dir;
+    if (newIndex < 0) newIndex = galleryState.images.length - 1;
+    if (newIndex >= galleryState.images.length) newIndex = 0;
+    
+    galleryState.selectedIndex = newIndex;
+    updateLightboxContent();
+}
+
+async function deleteCurrentLightboxImage() {
+    if (!confirm('Delete current image?')) return;
+    
+    const index = galleryState.selectedIndex;
+    const filename = galleryState.images[index];
+    const path = `user/images/${galleryState.currentFolder}/${filename}`;
+    
+    if (await deleteImageAPI(path)) {
+        galleryState.images.splice(index, 1);
+        toastr.success('Image deleted');
+        
+        if (galleryState.images.length === 0) {
+            $('#ct-gallery-lightbox').hide();
+            loadFolder(galleryState.currentFolder);
+        } else {
+            navigateLightbox(0); // Determine correct next index
+            loadFolder(galleryState.currentFolder); // Refresh grid backing
+        }
+    }
+}
+
+function downloadCurrentLightboxImage() {
+    const filename = galleryState.images[galleryState.selectedIndex];
+    const url = `user/images/${encodeURIComponent(galleryState.currentFolder)}/${encodeURIComponent(filename)}`;
+    
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}
+
+// --- Upload ---
+async function handleUpload(e) {
+    const files = e.target.files;
+    if (!files.length) return;
+    
+    const folder = galleryState.currentFolder;
+    if (!folder) return toastr.error("No folder selected");
+    
+    const context = getContext();
+    const getRequestHeaders = context?.getRequestHeaders || (() => ({}));
+    
+    let success = 0;
+    
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+         try {
+            const reader = new FileReader();
+            await new Promise((resolve, reject) => {
+                reader.onload = async () => {
+                   try {
+                     const base64Data = reader.result.split(',')[1];
+                     const extension = file.name.split('.').pop();
+                     const fileName = file.name.replace(/\./g, '_').replace(/\.[^.]+$/, '');
+                     
+                     const response = await fetch('/api/images/upload', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            ...getRequestHeaders(),
+                        },
+                        body: JSON.stringify({
+                            image: base64Data,
+                            format: extension,
+                            ch_name: folder,
+                            filename: fileName,
+                        }),
+                     });
+                     
+                     if (response.ok) {
+                         success++;
+                         resolve();
+                     } else {
+                         reject('Upload failed');
+                     }
+                   } catch (err) { reject(err); }
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+         } catch (err) {
+             console.error('Upload Error', err);
+         }
+    }
+    
+    if (success > 0) {
+        toastr.success(`Uploaded ${success} files details.`);
+        loadFolder(folder);
+    } else {
+        toastr.error("Failed to upload files.");
+    }
+    
+    // Clear input
+    e.target.value = '';
+}
+
+
+// --- Integrations ---
+
+// Robust Sidebar Injection
+function injectSidebarButton() {
+    const tryInject = () => {
+        if (window.CTSidebarButtons) {
+            window.CTSidebarButtons.registerButton({
+                id: 'ct-gallery',
+                icon: 'fa-solid fa-images',
+                title: 'Gallery Explorer',
+                onClick: () => openGallery(),
+                order: 40
+            });
+            console.log('CT-GalleryExplorer: Sidebar button registered.');
+            return true;
+        }
+        return false;
+    };
+
+    if (!tryInject()) {
+        const interval = setInterval(() => {
+            if (tryInject()) clearInterval(interval);
+        }, 1000);
+        // Stop retrying after 30 seconds
+        setTimeout(() => clearInterval(interval), 30000);
+    }
+}
+
+function injectCharacterHeaderButton() {
+    // 1. Extensions Menu (Reliable fallback)
+    const injectMenu = () => {
         const extensionsMenu = $('#extensionsMenu');
-        if (extensionsMenu.length) {
+        if (extensionsMenu.length && !$('#ext-gallery-btn').length) {
             extensionsMenu.append(`
-                <div class="list-group-item interactable" onclick="window.openGallery()">
-                    <div class="list-group-item-action">
-                        <i class="fa-solid fa-images"></i>
-                    </div>
-                    <div class="list-group-item-label">
-                        이미지 갤러리
-                    </div>
+                <div id="ext-gallery-btn" class="list-group-item interactable" onclick="window.CTGallery.open()">
+                    <div class="list-group-item-action"><i class="fa-solid fa-images"></i></div>
+                    <div class="list-group-item-label">CT Gallery Explorer</div>
                 </div>
             `);
-            console.log('Image Gallery button added to Extensions Menu');
-        } else {
-            console.warn('Extensions Menu not found, retrying...');
-            setTimeout(addGalleryButton, 500);
         }
     };
-    addGalleryButton();
-
-    function onCharacterLoaded(data) {
-        if ($('#st-image-gallery').is(':visible')) {
-            setTimeout(() => {
-                syncToCurrentCharacter();
-            }, 100);
+    
+    // 2. Character Top Bar Icons (Context dependent)
+    const injectHeader = () => {
+        // Match reference implementation using #rm_buttons_container
+        const container = $('#rm_buttons_container');
+        
+        if (container.length && !$('#char-gallery-btn').length) {
+            const buttonHtml = `
+                <div id="char-gallery-btn" class="menu_button fa-solid fa-images interactable" title="Gallery Explorer" onclick="window.CTGallery.open()"></div>
+            `;
+            
+            // Try to place after lorebook button like reference
+            const lorebookButton = $('.chat_lorebook_button');
+            if (lorebookButton.length) {
+                lorebookButton.after(buttonHtml);
+            } else {
+                container.append(buttonHtml);
+            }
         }
-    }
+    };
 
-    if (window.eventSource) {
-        const evtName = (window.event_types && window.event_types.CHARACTER_LOADED) ? window.event_types.CHARACTER_LOADED : 'characterLoaded';
-        eventSource.on(evtName, onCharacterLoaded);
-        console.log('Gallery: Registered Sync Listener for', evtName);
-    }
+    const interval = setInterval(() => {
+        injectMenu();
+        injectHeader();
+    }, 2000);
+}
 
-    window.openGallery = openGallery;
+
+// --- Initialization ---
+
+jQuery(async () => {
+    loadSettings();
+    
+    // Expose API
+    window.CTGallery = {
+        open: openGallery,
+        close: closeGallery,
+        loadFolder: loadFolder
+    };
+    
+    // Event listeners for global events
+    if (eventSource) {
+        eventSource.on(event_types.CHARACTER_LOADED, () => {
+            // Auto switch folder if gallery is open
+             if ($('#ct-gallery-explorer').is(':visible')) {
+                 const context = getContext();
+                 if (context.characters[context.characterId]) {
+                     loadFolder(context.characters[context.characterId].name);
+                 }
+             }
+        });
+    }
+    
+    // Wait for Sidebar Extension to likely load
+    setTimeout(injectSidebarButton, 2000); // Give it a moment
+    injectCharacterHeaderButton();
+    
     console.log(`${extensionName} Loaded`);
 });
