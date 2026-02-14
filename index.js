@@ -783,20 +783,7 @@ function injectSidebarButton() {
 }
 
 function injectCharacterHeaderButton() {
-    // 1. Extensions Menu (Reliable fallback)
-    const injectMenu = () => {
-        const extensionsMenu = $('#extensionsMenu');
-        if (extensionsMenu.length && !$('#ext-gallery-btn').length) {
-            extensionsMenu.append(`
-                <div id="ext-gallery-btn" class="list-group-item interactable" onclick="window.CTGallery.open()">
-                    <div class="list-group-item-action"><i class="fa-solid fa-images"></i></div>
-                    <div class="list-group-item-label">CT Gallery Explorer</div>
-                </div>
-            `);
-        }
-    };
-    
-    // 2. Character Top Bar Icons (Context dependent)
+    // Character Top Bar Icons (Context dependent)
     const injectHeader = () => {
         // Match reference implementation using #rm_buttons_container
         const container = $('#rm_buttons_container');
@@ -817,7 +804,6 @@ function injectCharacterHeaderButton() {
     };
 
     const interval = setInterval(() => {
-        injectMenu();
         injectHeader();
     }, 2000);
 }
