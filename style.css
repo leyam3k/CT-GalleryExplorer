@@ -2,7 +2,7 @@
     --ct-gallery-bg: var(--SmartThemeBlurTintColor, rgba(30, 30, 30, 0.95));
     --ct-gallery-border: var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
     --ct-gallery-text: var(--SmartThemeBodyColor, #e0e0e0);
-    --ct-gallery-accent: var(--SmartThemeQuoteColor, #ffaa00);
+    --ct-gallery-accent: #b0a0e8;
 }
 
 /* --- Main Window --- */
