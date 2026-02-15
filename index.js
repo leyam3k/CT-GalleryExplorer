@@ -758,28 +758,21 @@ async function handleUpload(e) {
 
 // Robust Sidebar Injection
 function injectSidebarButton() {
-    const tryInject = () => {
-        if (window.CTSidebarButtons) {
-            window.CTSidebarButtons.registerButton({
-                id: 'ct-gallery',
-                icon: 'fa-solid fa-images',
-                title: 'Gallery Explorer',
-                onClick: () => openGallery(),
-                order: 40
-            });
-            console.log('CT-GalleryExplorer: Sidebar button registered.');
-            return true;
-        }
-        return false;
-    };
-
-    if (!tryInject()) {
-        const interval = setInterval(() => {
-            if (tryInject()) clearInterval(interval);
-        }, 1000);
-        // Stop retrying after 30 seconds
-        setTimeout(() => clearInterval(interval), 30000);
+    // Check if CTSidebarButtons API is available
+    if (typeof window.CTSidebarButtons === "undefined") {
+        console.warn('CT-GalleryExplorer: CTSidebarButtons not found. Retrying in 500ms...');
+        setTimeout(injectSidebarButton, 500);
+        return;
     }
+
+    window.CTSidebarButtons.registerButton({
+        id: 'ct-gallery',
+        icon: 'fa-solid fa-images',
+        title: 'Gallery Explorer',
+        onClick: () => openGallery(),
+        order: 40
+    });
+    console.log('CT-GalleryExplorer: Sidebar button registered.');
 }
 
 function injectCharacterHeaderButton() {
@@ -834,8 +827,16 @@ jQuery(async () => {
         });
     }
     
-    // Wait for Sidebar Extension to likely load
-    setTimeout(injectSidebarButton, 2000); // Give it a moment
+    // Register sidebar button immediately (like reference implementation)
+    injectSidebarButton();
+    
+    // Also try to register on APP_READY in case CTSidebarButtons loads later
+    if (eventSource && event_types.APP_READY) {
+        eventSource.on(event_types.APP_READY, () => {
+            injectSidebarButton();
+        });
+    }
+    
     injectCharacterHeaderButton();
     
     console.log(`${extensionName} Loaded`);
