@@ -769,7 +769,13 @@ function injectSidebarButton() {
         id: 'ct-gallery',
         icon: 'fa-solid fa-images',
         title: 'Gallery Explorer',
-        onClick: () => openGallery(),
+        onClick: () => {
+            if ($('#ct-gallery-explorer').is(':visible')) {
+                closeGallery();
+            } else {
+                openGallery();
+            }
+        },
         order: 40
     });
     console.log('CT-GalleryExplorer: Sidebar button registered.');
